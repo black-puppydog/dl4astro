@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python
 
 '''
 Author: Edward J Kim <edward.junhyung.kim@gmail.com>
@@ -31,11 +31,16 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
+import argparse
 
 import os
 import shutil
+
+import logging
+
+import aiohttp as aiohttp
 import requests
-import json
+import tempfile
 import bz2
 import re
 import subprocess
@@ -47,13 +52,18 @@ import matplotlib.pyplot as plt
 #from mpi4py import MPI
 
 import montage_wrapper as mw
+import sys
 from astropy.io import fits
 from astropy import wcs
 
+from contextlib import closing
+import urllib.request
+import asyncio
 
-def fetch_fits(df, dirname="temp"):
 
-    bands = [c for c in 'ugriz']
+def fetch_fits(df, dirname):
+
+    bands = 'ugriz'
 
     if not os.path.exists(dirname):
         os.makedirs(dirname)
@@ -71,6 +81,7 @@ def fetch_fits(df, dirname="temp"):
 
             for _ in range(10):
                 try:
+                    print(url+filename+'.bz2')
                     resp = requests.get(url + filename + ".bz2")
                 except:
                     sleep(1)
@@ -100,32 +111,32 @@ def get_ref_list(df):
 
     return ref_images
 
-def align_images(images, frame_dir="temp", registered_dir="temp"):
+def align_images(images, tmp_dir):
     '''
     '''
 
-    if not os.path.exists(registered_dir):
-        os.makedirs(registered_dir)
+    if not os.path.exists(tmp_dir):
+        os.makedirs(tmp_dir)
     
     for image in images:
         
         #print("Processing {}...".format(image))
     
         frame_path = [
-            os.path.join(frame_dir, image.replace("frame-r-", "frame-{}-").format(b))
+            os.path.join(tmp_dir, image.replace("frame-r-", "frame-{}-").format(b))
             for b in "ugriz"
             ]
         registered_path = [
-            os.path.join(registered_dir, image.replace("frame-r-", "registered-{}-").format(b))
+            os.path.join(tmp_dir, image.replace("frame-r-", "registered-{}-").format(b))
             for b in "ugriz"
             ]
 
         header = os.path.join(
-            registered_dir,
+            tmp_dir,
             image.replace("frame", "header").replace(".fits", ".hdr")
             )
 
-        mw.commands.mGetHdr(os.path.join(frame_dir, image), header)
+        mw.commands.mGetHdr(os.path.join(tmp_dir, image), header)
         mw.reproject(
             frame_path, registered_path,
             header=header, exact_size=True, silent_cleanup=True, common=True
@@ -134,7 +145,7 @@ def align_images(images, frame_dir="temp", registered_dir="temp"):
     return None
 
 
-def convert_catalog_to_pixels(df, dirname="temp"):
+def convert_catalog_to_pixels(df, dirname):
 
     if not os.path.exists(dirname):
         os.makedirs(dirname)
@@ -321,7 +332,7 @@ def run_sex(df, dirname="temp"):
     
         shutil.copy(list_path, os.getcwd())
     
-        subprocess.call(["sex", "-c", config_file, fpath])
+        subprocess.call(["sextractor", "-c", config_file, fpath])
 
         os.remove(config_file)
     
@@ -366,10 +377,7 @@ def nanomaggie_to_luptitude(array, band):
     
     return luptitude
 
-def save_cutout(df, cat, size=48, image_dir="temp", save_dir="result"):
-
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
+def save_cutout(df, cat, image_dir, save_dir, size=48):
 
     saved = pd.DataFrame()
 
@@ -414,12 +422,12 @@ def save_cutout(df, cat, size=48, image_dir="temp", save_dir="result"):
             save_path = os.path.join(save_dir, "{0}.{1}x{1}.{2}.npy".format(row["class"], size, row["objID"]))
             np.save(save_path, array)
 
-def run_online_mode(filename="DR12_spec_phot_sample.csv"):
+def run_online_mode(filename, output_folder):
 
     df = pd.read_csv(filename, dtype={"objID": "object"})
 
-    if os.path.exists("result"):
-        done = os.listdir("result")
+    if os.path.exists(output_folder):
+        done = os.listdir(output_folder)
         done = [d.split(".")[2] for d in done]
         # check existing results and skip
         df = df[~df.objID.isin(done)]
@@ -428,68 +436,130 @@ def run_online_mode(filename="DR12_spec_phot_sample.csv"):
     write_default_param()
     write_default_sex()
 
-    for i in range(0, len(df)):
-        chunk = df[i: i + 1]
-        # download image fits files
-        fetch_fits(chunk)
-        ref_images = get_ref_list(chunk)
-        align_images(ref_images)
-        convert_catalog_to_pixels(chunk)
-        cat = run_sex(chunk)
-        try:
-            saved = save_cutout(chunk, cat, size=48)
-        except:
-            pass
-        shutil.rmtree("temp")
-        print("{} objects remaining...".format(len(df) - 1 - i))
+    N = len(df)
+    tasks = list()
+    for i in range(0, 2):
+        download_record(df[i: i+1], i, output_folder)
 
-def run_parallel(filename, dest=None):
-
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    size = comm.Get_size()
-
-    if rank == 0:
-        print("Running on {} cores...\n".format(size))
-
-        write_default_conv()
-        write_default_param()
-        write_default_sex()
+async def run_online_mode_parallel(filename, output_folder):
 
     df = pd.read_csv(filename, dtype={"objID": "object"})
 
-    if os.path.exists("result"):
-        done = os.listdir("result")
+    if os.path.exists(output_folder):
+        done = os.listdir(output_folder)
         done = [d.split(".")[2] for d in done]
         # check existing results and skip
-        df = df[~df.objID.isin(done)].dropna()
+        df = df[~df.objID.isin(done)]
 
-    start = int(rank / size * len(df))
-    end = int((rank + 1) / size * len(df))
-    df = df[start:end]
+    write_default_conv()
+    write_default_param()
+    write_default_sex()
 
-    if dest is None:
-        dest = os.getcwd()
-    temp_dir = os.path.join(dest, "temp{}".format(rank))
-    target_dir = os.path.join(dest, "result".format(rank))
+    N = len(df)
+    tasks = list()
+    for i in range(0, 2):
+        tasks.append(download_record_parallel(df[i: i+1], i, output_folder))
+    print(tasks)
+    await asyncio.wait(tasks)
 
-    for i in range(0, len(df)):
-        chunk = df[i: i + 1]
-        try:
-            # download image fits files
-            fetch_fits(chunk, dirname=temp_dir)
-            ref_images = get_ref_list(chunk)
-            align_images(ref_images, frame_dir=temp_dir, registered_dir=temp_dir)
-            convert_catalog_to_pixels(chunk, dirname=temp_dir)
-            cat = run_sex(chunk, dirname=temp_dir)
-            saved = save_cutout(cat, image_dir=temp_dir, save_dir=target_dir)
-            shutil.rmtree(temp_dir)
-            print("Core {}: processing successful...".format(rank))
-        except:
-            print("Core {} failed to process an object...".format(rank))
 
-        print("Core {}: {} objects remaining...".format(rank, len(df) - 1 - i))
+async def download(url, filename, session, chunk_size=1 << 15, num_try=3):
+    # with (yield from semaphore_download):  # limit number of concurrent downloads
+        for t in range(num_try):
+            try:
+                logging.info('downloading %s', filename+'.bz2')
+                with session.get(filename+'.bz2') as resp:
+                    with open(filename, "wb") as f:
+                        img = bz2.decompress(await resp.text())
+                        f.write(img)
+                logging.info('done %s', filename)
+                success = True
+            except:
+                success = False
+                if t == num_try - 1:
+                    logging.error('failed to download {}'.format(url))
+                    raise
+            if success:
+                break
+
+def download_parallel(urls_filenames, output_folder):
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+    with closing(asyncio.get_event_loop()) as loop, \
+            closing(aiohttp.ClientSession()) as session:
+        download_tasks = (download(url+fname, output_folder+fname, session) for url, fname in urls_filenames)
+        result = loop.run_until_complete(asyncio.gather(*download_tasks))
+
+async def download_record_parallel(chunk, i, output_folder):
+    tmp_dir = tempfile.mkdtemp(dir='/tmp')
+
+    bands = 'ugriz'
+
+    if not os.path.exists(tmp_dir):
+        os.makedirs(tmp_dir)
+
+    print(tmp_dir)
+    urls_filenames = (("http://data.sdss3.org/sas/dr12/boss/photoObj/frames/{r.rerun}/{r.run}/{r.camcol}/".format(r=r, band=b),
+                      "frame-{band}-{r.run:06d}-{r.camcol}-{r.field:04d}.fits".format(r=r, band=b))
+                      for (_, r) in chunk.iterrows() for b in bands)
+    # download image fits files
+    download_parallel(urls_filenames, tmp_dir)
+    ref_images = get_ref_list(chunk)
+    align_images(ref_images, tmp_dir)
+    convert_catalog_to_pixels(chunk, tmp_dir)
+    cat = run_sex(chunk, tmp_dir)
+    try:
+        saved = save_cutout(chunk, cat, size=48, image_dir=tmp_dir, save_dir=output_folder)
+    except:
+        print('failed to fetch entry {}'.format(i), file=sys.stderr)
+    # shutil.rmtree(tmp_dir)
+
+def download_record(chunk, i, output_folder):
+    # download image fits files
+    tmp_dir = tempfile.mkdtemp(dir='/tmp')
+    print(tmp_dir)
+    fetch_fits(chunk, tmp_dir)
+    ref_images = get_ref_list(chunk)
+    align_images(ref_images, tmp_dir)
+    convert_catalog_to_pixels(chunk, tmp_dir)
+    cat = run_sex(chunk, tmp_dir)
+    try:
+        saved = save_cutout(chunk, cat, size=48, image_dir=tmp_dir, save_dir=output_folder)
+    except:
+        print('failed to fetch entry {}'.format(i), file=sys.stderr)
+    # shutil.rmtree(tmp_dir)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Download data from sdss3.org',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('-p', '--parallel', action='store_true', help='use multiple threads for downloading and processing')
+    parser.add_argument('-i', '--input-csv', help='csv file obtained from CasJobs', default='DR12_spec_phot_sample.csv')
+    parser.add_argument('-o', '--output-folder', help='where to store the results', default='result')
+    parser.add_argument('-td', '--download-threads', help='how many threads to use for downloading', type=int, default=2)
+    parser.add_argument('-ts', '--sextractor-threads', help='how many threads to use for sextractor calls', type=int, default=2)
+    parser.add_argument('-tm', '---montage-threads', help='how many threads to use for montage calls', type=int, default=2)
+    args = parser.parse_args()
+
+    if not os.path.exists(args.output_folder):
+        os.makedirs(args.output_folder)
+
+    if not args.parallel:
+        run_online_mode(args.input_csv, args.output_folder)
+        sys.exit()
+    print('using parallel processing')
+
+    global semaphore_download
+    semaphore_download = asyncio.Semaphore(args.download_threads)
+    global semaphore_sextractor
+    semaphore_sextractor = asyncio.Semaphore(args.sextractor_threads)
+    global semaphore_montage
+    semaphore_montage = asyncio.Semaphore(args.montage_threads)
+
+    tasks = run_online_mode_parallel(args.input_csv, args.output_folder)
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(tasks)
+
 
 if __name__ == "__main__":
-
-    run_online_mode("DR12_spec_phot_sample.csv")
+    main()

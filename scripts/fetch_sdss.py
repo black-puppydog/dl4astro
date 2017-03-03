@@ -60,6 +60,8 @@ from contextlib import closing
 import urllib.request
 import asyncio
 
+from multiprocessing import Pool
+
 
 def fetch_fits(df, dirname):
 
@@ -422,7 +424,7 @@ def save_cutout(df, cat, image_dir, save_dir, size=48):
             save_path = os.path.join(save_dir, "{0}.{1}x{1}.{2}.npy".format(row["class"], size, row["objID"]))
             np.save(save_path, array)
 
-def run_online_mode(filename, output_folder):
+def run_online_mode(filename, output_folder, threads):
 
     df = pd.read_csv(filename, dtype={"objID": "object"})
 
@@ -437,9 +439,13 @@ def run_online_mode(filename, output_folder):
     write_default_sex()
 
     N = len(df)
-    tasks = list()
-    for i in range(0, 2):
-        download_record(df[i: i+1], i, output_folder)
+    if threads == 1:
+      for i in range(N):
+          download_record(df, i, output_folder)
+          print(' {:6}/{:6}'.format(i+1, N))
+    else:
+      with Pool(threads) as pool:
+          pool.starmap(download_record, ((df, i, output_folder) for i in range(N)))
 
 async def run_online_mode_parallel(filename, output_folder):
 
@@ -490,7 +496,7 @@ def download_parallel(urls_filenames, output_folder):
         result = loop.run_until_complete(asyncio.gather(*download_tasks))
 
 async def download_record_parallel(chunk, i, output_folder):
-    tmp_dir = tempfile.mkdtemp(dir='/tmp')
+    tmp_dir = tempfile.mkdtemp(dir='/tmp/dldl4a')
 
     bands = 'ugriz'
 
@@ -513,7 +519,8 @@ async def download_record_parallel(chunk, i, output_folder):
         print('failed to fetch entry {}'.format(i), file=sys.stderr)
     # shutil.rmtree(tmp_dir)
 
-def download_record(chunk, i, output_folder):
+def download_record(df, i, output_folder):
+    chunk = df[i: i+1]
     # download image fits files
     tmp_dir = tempfile.mkdtemp(dir='/tmp')
     print(tmp_dir)
@@ -526,7 +533,8 @@ def download_record(chunk, i, output_folder):
         saved = save_cutout(chunk, cat, size=48, image_dir=tmp_dir, save_dir=output_folder)
     except:
         print('failed to fetch entry {}'.format(i), file=sys.stderr)
-    # shutil.rmtree(tmp_dir)
+    finally:
+      shutil.rmtree(tmp_dir)
 
 
 def main():
@@ -536,16 +544,17 @@ def main():
     parser.add_argument('-p', '--parallel', action='store_true', help='use multiple threads for downloading and processing')
     parser.add_argument('-i', '--input-csv', help='csv file obtained from CasJobs', default='DR12_spec_phot_sample.csv')
     parser.add_argument('-o', '--output-folder', help='where to store the results', default='result')
-    parser.add_argument('-td', '--download-threads', help='how many threads to use for downloading', type=int, default=2)
+    parser.add_argument('-td', '--download-threads', help='how many threads to use for downloading', type=int, default=1)
     parser.add_argument('-ts', '--sextractor-threads', help='how many threads to use for sextractor calls', type=int, default=2)
     parser.add_argument('-tm', '---montage-threads', help='how many threads to use for montage calls', type=int, default=2)
     args = parser.parse_args()
+    print(args)
 
     if not os.path.exists(args.output_folder):
         os.makedirs(args.output_folder)
 
     if not args.parallel:
-        run_online_mode(args.input_csv, args.output_folder)
+        run_online_mode(args.input_csv, args.output_folder, args.download_threads)
         sys.exit()
     print('using parallel processing')
 
